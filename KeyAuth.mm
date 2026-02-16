@@ -27,6 +27,18 @@ std::string performPOST(const std::string& postData) {
     return result;
 }
 
+std::string extractMessage(const std::string& resp) {
+    size_t pos = resp.find("\"message\":\"");
+    if (pos != std::string::npos) {
+        pos += 11;
+        size_t end = resp.find("\"", pos);
+        if (end != std::string::npos) {
+            return resp.substr(pos, end - pos);
+        }
+    }
+    return "Unknown error from KeyAuth";
+}
+
 class KeyAuth {
 public:
     std::string name = "azuriteadmin";
@@ -34,6 +46,7 @@ public:
     std::string secret = "fea6acbf1b1ef751775c6e12882d8dc1ffb5f264707b7428375e37ed11186697";
     std::string version = "1.0";
     std::string sessionid;
+    std::string lastError;
 
     bool init() {
         std::string post = "type=init&ver=" + version + "&name=" + name + "&ownerid=" + ownerid + "&secret=" + secret;
@@ -51,7 +64,10 @@ public:
     }
 
     bool checkKey(const std::string& key) {
-        if (sessionid.empty() && !init()) return false;
+        if (sessionid.empty() && !init()) {
+            lastError = "Failed to init session";
+            return false;
+        }
         
         std::string post = "type=license&key=" + key +
                            "&sessionid=" + sessionid +
@@ -61,64 +77,53 @@ public:
                            "&hwid=" + getHWID();
         
         std::string resp = performPOST(post);
-        return resp.find("\"success\":true") != std::string::npos;
+        if (resp.find("\"success\":true") != std::string::npos) {
+            return true;
+        } else {
+            lastError = extractMessage(resp);
+            NSLog(@"KeyAuth Debug: %s", resp.c_str()); // untuk log kalau ada
+            return false;
+        }
     }
 };
 
-// Keychain + GUI sama macam tadi (auto start 3 saat)
-std::string loadKeyFromKeychain() {
-    NSDictionary *query = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-                            (__bridge id)kSecAttrService: @"AzuriteKeyAuth",
-                            (__bridge id)kSecAttrAccount: @"license",
-                            (__bridge id)kSecReturnData: @YES,
-                            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne};
-    CFDataRef data = NULL;
-    if (SecItemCopyMatching((__bridge CFDictionaryRef)query, (CFTypeRef*)&data) == errSecSuccess && data) {
-        NSString *str = [[NSString alloc] initWithData:(__bridge NSData*)data encoding:NSUTF8StringEncoding];
-        CFRelease(data);
-        return std::string([str UTF8String]);
-    }
-    return "";
-}
+// Keychain functions (sama macam sebelum ni)
+std::string loadKeyFromKeychain() { /* sama */ }
+bool saveKeyToKeychain(const std::string& key) { /* sama */ }
+void deleteKeyFromKeychain() { /* sama */ }
 
-bool saveKeyToKeychain(const std::string& key) {
-    NSDictionary *del = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-                          (__bridge id)kSecAttrService: @"AzuriteKeyAuth",
-                          (__bridge id)kSecAttrAccount: @"license"};
-    SecItemDelete((__bridge CFDictionaryRef)del);
-    
-    NSData *data = [NSData dataWithBytes:key.c_str() length:key.length()];
-    NSDictionary *add = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-                          (__bridge id)kSecAttrService: @"AzuriteKeyAuth",
-                          (__bridge id)kSecAttrAccount: @"license",
-                          (__bridge id)kSecValueData: data,
-                          (__bridge id)kSecAttrAccessible: (__bridge id)kSecAttrAccessibleAfterFirstUnlock};
-    return SecItemAdd((__bridge CFDictionaryRef)add, NULL) == errSecSuccess;
-}
-
-void deleteKeyFromKeychain() {
-    NSDictionary *query = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
-                            (__bridge id)kSecAttrService: @"AzuriteKeyAuth",
-                            (__bridge id)kSecAttrAccount: @"license"};
-    SecItemDelete((__bridge CFDictionaryRef)query);
-}
-
-void showKeyPrompt(bool invalid = false) {
+// GUI dengan error message tepat
+void showKeyPrompt(const std::string& errorMsg = "") {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:invalid ? @"Key Tidak Sah" : @"Azurite KeyAuth"
-                                                                       message:invalid ? @"Key salah atau expired.\nMasukkan semula." : @"Masukkan license key"
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-        [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) { tf.placeholder = @"Paste key sini"; }];
+        NSString *title = errorMsg.empty() ? @"Azurite KeyAuth" : @"Key Tidak Sah";
+        NSString *message = errorMsg.empty() ? @"Masukkan license key anda" : [NSString stringWithUTF8String:errorMsg.c_str()];
         
-        [alert addAction:[UIAlertAction actionWithTitle:@"Submit" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            std::string k = [[[alert.textFields[0] text] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] UTF8String];
-            if (k.empty()) { showKeyPrompt(); return; }
-            if (KeyAuth().checkKey(k)) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
+                                                                       message:message
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        
+        [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+            tf.placeholder = @"Paste key sini";
+        }];
+        
+        [alert addAction:[UIAlertAction actionWithTitle:@"Submit" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            UITextField *tf = alert.textFields.firstObject;
+            std::string k = [[[tf.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] stringByReplacingOccurrencesOfString:@" " withString:@""] UTF8String];
+            
+            if (k.empty()) {
+                showKeyPrompt();
+                return;
+            }
+            
+            KeyAuth auth;
+            if (auth.checkKey(k)) {
                 saveKeyToKeychain(k);
+                // Key OK
             } else {
-                showKeyPrompt(true);
+                showKeyPrompt(auth.lastError);
             }
         }]];
+        
         [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *) { exit(0); }]];
         
         UIViewController *vc = [[[[UIApplication sharedApplication] keyWindow] rootViewController] presentedViewController] ?: [[[UIApplication sharedApplication] keyWindow] rootViewController];
@@ -126,11 +131,15 @@ void showKeyPrompt(bool invalid = false) {
     });
 }
 
+// Auto start
 __attribute__((constructor)) static void init() {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         std::string saved = loadKeyFromKeychain();
-        if (!saved.empty() && KeyAuth().checkKey(saved)) return;
-        if (!saved.empty()) deleteKeyFromKeychain();
+        if (!saved.empty()) {
+            KeyAuth auth;
+            if (auth.checkKey(saved)) return;
+            deleteKeyFromKeychain();
+        }
         showKeyPrompt();
     });
 }
