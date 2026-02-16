@@ -35,6 +35,24 @@ public:
     std::string secret = "fea6acbf1b1ef751775c6e12882d8dc1ffb5f264707b7428375e37ed11186697";
     std::string version = "1.0";
     std::string sessionid;
+
+    void checkKey(const std::string& key, void(^callback)(bool valid, std::string message)) {
+        std::string post = "type=license&key=" + key + "&sessionid=" + sessionid +
+                           "&name=" + name + "&ownerid=" + ownerid + "&secret=" + secret +
+                           "&hwid=" + getHWID();
+
+        performPOST(post, ^(std::string resp, std::string err) {
+            if (!err.empty()) {
+                callback(false, "Network Error: " + err);
+                return;
+            }
+            if (resp.find("\"success\":true") != std::string::npos) {
+                callback(true, "");
+            } else {
+                callback(false, resp.empty() ? "No response from server" : resp);
+            }
+        });
+    }
 };
 
 // ================== KEYCHAIN ==================
@@ -75,34 +93,36 @@ void deleteKeyFromKeychain() {
     SecItemDelete((__bridge CFDictionaryRef)query);
 }
 
-// ================== UI HELPER ==================
+// ================== UI ==================
 UIViewController* getTopVC() {
     UIViewController *vc = [[UIApplication sharedApplication] keyWindow].rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
     return vc;
 }
 
-// ================== MAIN FUNCTION ==================
+void showKeyPrompt(const std::string& error = "");
+
+// ================== START & LOGIC ==================
 void startKeyAuth() {
     std::string saved = loadKeyFromKeychain();
     if (!saved.empty()) {
-        // Check saved key
         std::string initPost = "type=init&ver=1.0&name=azuriteadmin&ownerid=8z9qsAXGks&secret=fea6acbf1b1ef751775c6e12882d8dc1ffb5f264707b7428375e37ed11186697";
         performPOST(initPost, ^(std::string resp, std::string err) {
-            if (err.empty() && resp.find("\"success\":true") != std::string::npos) {
-                size_t pos = resp.find("\"sessionid\":\"");
-                if (pos != std::string::npos) {
-                    pos += 14;
-                    size_t end = resp.find("\"", pos);
-                    if (end != std::string::npos) {
-                        KeyAuth auth;
-                        auth.sessionid = resp.substr(pos, end - pos);
-                        auth.checkKey(saved, ^(bool valid, std::string msg) {
-                            if (valid) return; // key masih ok
+            if (!err.empty() || resp.find("\"success\":true") == std::string::npos) return;
+            
+            size_t pos = resp.find("\"sessionid\":\"");
+            if (pos != std::string::npos) {
+                pos += 14;
+                size_t end = resp.find("\"", pos);
+                if (end != std::string::npos) {
+                    KeyAuth auth;
+                    auth.sessionid = resp.substr(pos, end - pos);
+                    auth.checkKey(saved, ^(bool valid, std::string msg) {
+                        if (!valid) {
                             deleteKeyFromKeychain();
                             showKeyPrompt(msg);
-                        });
-                    }
+                        }
+                    });
                 }
             }
         });
@@ -111,7 +131,7 @@ void startKeyAuth() {
     showKeyPrompt();
 }
 
-void showKeyPrompt(const std::string& error = "") {
+void showKeyPrompt(const std::string& error) {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSString *title = error.empty() ? @"Azurite KeyAuth" : @"Key Error";
         NSString *msg = error.empty() ? @"Masukkan license key anda" : [NSString stringWithUTF8String:error.c_str()];
@@ -120,9 +140,8 @@ void showKeyPrompt(const std::string& error = "") {
         [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) { tf.placeholder = @"Paste key sini"; }];
         
         [alert addAction:[UIAlertAction actionWithTitle:@"Submit" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-            __block UIAlertController *mainAlert = alert; // untuk dismiss nanti
             std::string k = [[[alert.textFields[0] text] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] UTF8String];
-            if (k.empty()) { showKeyPrompt(); return; }
+            if (k.empty()) { showKeyPrompt(""); return; }
             
             UIAlertController *loading = [UIAlertController alertControllerWithTitle:@"Checking Key..." message:nil preferredStyle:UIAlertControllerStyleAlert];
             [getTopVC() presentViewController:loading animated:YES completion:nil];
@@ -146,13 +165,10 @@ void showKeyPrompt(const std::string& error = "") {
                 
                 auth.checkKey(k, ^(bool valid, std::string message) {
                     [loading dismissViewControllerAnimated:YES completion:^{
-                        [mainAlert dismissViewControllerAnimated:YES completion:^{
+                        [alert dismissViewControllerAnimated:YES completion:^{
                             if (valid) {
                                 saveKeyToKeychain(k);
-                                // Success popup
-                                UIAlertController *success = [UIAlertController alertControllerWithTitle:@"Berjaya!" 
-                                                                                                 message:@"Key sah! Cheat diaktifkan." 
-                                                                                          preferredStyle:UIAlertControllerStyleAlert];
+                                UIAlertController *success = [UIAlertController alertControllerWithTitle:@"Berjaya!" message:@"Key sah! Cheat diaktifkan." preferredStyle:UIAlertControllerStyleAlert];
                                 [success addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
                                 [getTopVC() presentViewController:success animated:YES completion:nil];
                             } else {
